@@ -1,0 +1,105 @@
+name: Agent Evaluation
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  evaluate:
+    name: Run Evaluation Harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PYTHONPATH: .
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run evaluation
+        id: eval
+        run: |
+          set -e
+          OUTPUT=$(uv run python -m evaluations.eval_all 2>&1)
+          echo "$OUTPUT"
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Parse results
+        if: always()
+        run: |
+          OUTPUT="${{ steps.eval.outputs.output }}"
+          # Extract pass rate
+          PASS_RATE=$(echo "$OUTPUT" | grep -oP 'Pass Rate: \K[\d.]+' || echo "0")
+          PASSED=$(echo "$OUTPUT" | grep -oP 'Passed: \K\d+' || echo "0")
+          FAILED=$(echo "$OUTPUT" | grep -oP 'Failed: \K\d+' || echo "0")
+          
+          echo "pass_rate=$PASS_RATE" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { pass_rate, passed, failed } = ${{ toJson(steps.parse.outputs) }};
+            const body = `## 🧪 Agent Evaluation Results
+            | Metric | Value |
+            |--------|-------|
+            | **Pass Rate** | ${pass_rate}% |
+            | **Passed** | ${passed} |
+            | **Failed** | ${failed} |
+            
+            [View full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail if pass rate below threshold
+        if: ${{ steps.parse.outputs.pass_rate < 70 }}
+        run: |
+          echo "❌ Pass rate ${{ steps.parse.outputs.pass_rate }}% below 70% threshold"
+          exit 1
+
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install dev dependencies
+        run: uv sync --frozen --dev
+      - name: Run ruff
+        run: uv run ruff check .
+      - name: Run mypy
+        run: uv run mypy agent/ evaluations/
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install dev dependencies
+        run: uv sync --frozen --dev
+      - name: Run pytest
+        run: uv run pytest tests/ -v
